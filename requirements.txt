@@ -1,0 +1,34 @@
+# FastAPI and server
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# MongoDB
+pymongo==4.6.1
+motor==3.3.2
+
+# Excel processing
+openpyxl==3.1.2
+pandas==2.1.4
+
+# Speech to text (Whisper)
+openai-whisper==20231117
+torch>=2.0.0
+
+# HTTP client for Ollama
+httpx==0.26.0
+aiohttp==3.9.1
+
+# Audio processing
+pydub==0.25.1
+soundfile==0.12.1
+numpy>=1.24.0
+
+# Utilities
+python-dotenv==1.0.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+uuid6==2024.1.12
+
+# CORS
+starlette==0.35.1
