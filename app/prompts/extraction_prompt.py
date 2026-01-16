@@ -4,6 +4,19 @@ LLM Prompts for data extraction from Arabic speech transcriptions.
 
 from typing import List
 
+# Keywords that indicate a new row
+ROW_SEPARATOR_KEYWORDS = [
+    "السطر التالي",
+    "الصف التالي",
+    "سطر جديد",
+    "صف جديد",
+    "التالي",
+    "انتقل للسطر التالي",
+    "انتقل للصف التالي",
+    "سجل جديد",
+    "إدخال جديد",
+]
+
 # System prompt for the LLM
 SYSTEM_PROMPT = """أنت مساعد متخصص في استخراج البيانات من النصوص العربية المنطوقة.
 مهمتك هي تحليل النص الصوتي المحول وربط كل قيمة بالعمود المناسب.
@@ -23,6 +36,34 @@ SYSTEM_PROMPT = """أنت مساعد متخصص في استخراج البيان
 
 مهم جداً:
 - أرجع JSON فقط بدون أي نص إضافي أو شرح
+- لا تضع الـ JSON داخل code blocks
+- تأكد من أن JSON صالح ويمكن تحليله"""
+
+# System prompt for multi-row extraction
+SYSTEM_PROMPT_MULTI_ROW = """أنت مساعد متخصص في استخراج البيانات من النصوص العربية المنطوقة.
+مهمتك هي تحليل النص الصوتي المحول وربط كل قيمة بالعمود المناسب.
+
+هام جداً: النص قد يحتوي على بيانات لعدة صفوف/سجلات.
+الكلمات التالية تشير إلى بداية صف جديد:
+- "السطر التالي" أو "الصف التالي"
+- "سطر جديد" أو "صف جديد"
+- "التالي"
+- "سجل جديد" أو "إدخال جديد"
+
+القواعد الصارمة التي يجب اتباعها:
+1. استخرج فقط البيانات الموجودة في النص - لا تخترع بيانات
+2. اربط كل قيمة بالعمود الصحيح من القائمة المتاحة فقط
+3. حوّل الأرقام المنطوقة إلى أرقام عربية:
+   - "خمسة وأربعون" → "45"
+   - "مئة وعشرون" → "120"
+4. للهواتف والأرقام الوطنية - أرقام متتالية:
+   - "صفر تسعة تسعة ثمانية" → "0998"
+   - حافظ دائماً على الأصفار في البداية
+5. إذا لم تجد قيمة لعمود، اجعله null
+6. لا تضف أعمدة جديدة غير موجودة في القائمة المتاحة
+
+مهم جداً:
+- أرجع JSON array يحتوي على object لكل صف
 - لا تضع الـ JSON داخل code blocks
 - تأكد من أن JSON صالح ويمكن تحليله"""
 
@@ -59,6 +100,48 @@ def get_extraction_prompt(headers: List[str], transcription: str) -> str:
 }}
 
 أرجع JSON فقط:"""
+
+    return prompt
+
+
+def get_multi_row_extraction_prompt(headers: List[str], transcription: str) -> str:
+    """
+    Generate the user prompt for multi-row data extraction.
+
+    Args:
+        headers: List of column headers from the Excel file
+        transcription: The transcribed text from speech (may contain multiple rows)
+
+    Returns:
+        Formatted prompt string
+    """
+    headers_str = "، ".join(headers)
+
+    prompt = f"""الأعمدة المتاحة في ملف Excel:
+[{headers_str}]
+
+النص المنطوق من المستخدم (قد يحتوي على عدة صفوف):
+"{transcription}"
+
+استخرج البيانات من النص وأرجعها بصيغة JSON array.
+كل عنصر في الـ array يمثل صف واحد.
+إذا ذكر المستخدم "السطر التالي" أو "صف جديد" أو "التالي"، ابدأ صف جديد.
+
+مثال على الصيغة المطلوبة:
+[
+  {{
+    "الاسم": "محمد",
+    "الرقم": "45",
+    "الهاتف": "0998107722"
+  }},
+  {{
+    "الاسم": "أحمد",
+    "الرقم": "30",
+    "الهاتف": "0991234567"
+  }}
+]
+
+أرجع JSON array فقط:"""
 
     return prompt
 

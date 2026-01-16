@@ -13,8 +13,9 @@ import traceback
 
 from app.config import settings
 from app.services.whisper_service import get_whisper_service, WhisperError
-from app.services.llm_service import get_llm_service, LLMError
+from app.services.llm_service import get_llm_service, LLMError, MultiRowExtractionResult
 from app.services.session_service import get_session_service
+from app.prompts.extraction_prompt import ROW_SEPARATOR_KEYWORDS
 from app.models.error_log import ErrorType, ErrorContext
 from app.models.parsed_row import LLMResponseInfo
 
@@ -173,6 +174,269 @@ async def process_audio(
                 "llm": extraction_result.processing_time_ms if hasattr(extraction_result, 'processing_time_ms') else 0
             }
         }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        await session_service.log_error(
+            session_id=session_id,
+            error_type=ErrorType.SYSTEM,
+            error_message=str(e),
+            stack_trace=traceback.format_exc(),
+            context=ErrorContext(row_number=current_row)
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Processing failed: {e}"
+        )
+
+
+def _has_row_separators(text: str) -> bool:
+    """Check if text contains row separator keywords."""
+    text_lower = text.lower()
+    for keyword in ROW_SEPARATOR_KEYWORDS:
+        if keyword in text_lower:
+            return True
+    return False
+
+
+@router.post("/process-multi/{session_id}")
+async def process_audio_multi_row(
+    session_id: str,
+    file: UploadFile = File(...),
+    start_row: Optional[int] = Form(None)
+):
+    """
+    Process an audio file that may contain multiple rows of data.
+
+    The user can say keywords like "السطر التالي" or "صف جديد" to indicate
+    they're moving to a new row.
+
+    Args:
+        session_id: Session ID
+        file: Audio file (wav, mp3, webm, etc.)
+        start_row: Starting row number (uses current_row if not provided)
+
+    Returns:
+        List of transcriptions and extracted data for each row
+    """
+    session_service = get_session_service()
+    whisper_service = get_whisper_service()
+    llm_service = get_llm_service()
+
+    # Get session and validate
+    session = await session_service.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+
+    if not session.excel_file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No Excel file uploaded. Please upload an Excel file first."
+        )
+
+    # Determine starting row number
+    current_row = start_row if start_row else session.excel_file.current_row
+    headers = session.excel_file.headers
+
+    try:
+        # 1. Save audio file
+        audio_path = await _save_audio_file(session_id, current_row, file)
+
+        # Create audio log
+        await session_service.create_audio_log(
+            session_id=session_id,
+            row_number=current_row,
+            audio_file_path=audio_path
+        )
+
+        # 2. Transcribe with Whisper
+        try:
+            transcription_result = await whisper_service.transcribe_async(audio_path)
+            transcription_text = transcription_result.text
+
+            # Update audio log with transcription
+            await session_service.update_audio_transcription(
+                session_id=session_id,
+                row_number=current_row,
+                text=transcription_text,
+                confidence=transcription_result.confidence,
+                processing_time_ms=transcription_result.processing_time_ms
+            )
+
+        except WhisperError as e:
+            await session_service.log_error(
+                session_id=session_id,
+                error_type=ErrorType.WHISPER,
+                error_message=str(e),
+                stack_trace=traceback.format_exc(),
+                context=ErrorContext(
+                    row_number=current_row,
+                    audio_file=audio_path
+                )
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Transcription failed: {e}"
+            )
+
+        # 3. Check if multi-row or single-row
+        is_multi_row = _has_row_separators(transcription_text)
+
+        if is_multi_row:
+            # Extract data for multiple rows
+            try:
+                extraction_result = await llm_service.extract_multi_row_data(
+                    transcription=transcription_text,
+                    headers=headers
+                )
+
+                if not extraction_result.success:
+                    await session_service.log_error(
+                        session_id=session_id,
+                        error_type=ErrorType.LLM,
+                        error_message=extraction_result.error_message or "Unknown LLM error",
+                        context=ErrorContext(
+                            row_number=current_row,
+                            transcription=transcription_text
+                        )
+                    )
+
+                rows_data = extraction_result.rows
+
+            except LLMError as e:
+                await session_service.log_error(
+                    session_id=session_id,
+                    error_type=ErrorType.LLM,
+                    error_message=str(e),
+                    stack_trace=traceback.format_exc(),
+                    context=ErrorContext(
+                        row_number=current_row,
+                        transcription=transcription_text
+                    )
+                )
+                rows_data = [{header: None for header in headers}]
+                extraction_result = MultiRowExtractionResult(
+                    raw_json='',
+                    rows=rows_data,
+                    processing_time_ms=0,
+                    success=False
+                )
+
+            # Create parsed rows for each extracted row
+            results = []
+            for i, row_data in enumerate(rows_data):
+                row_num = current_row + i
+
+                llm_response_info = LLMResponseInfo(
+                    raw_json=extraction_result.raw_json if i == 0 else '',
+                    parsed_data=row_data,
+                    processing_time_ms=extraction_result.processing_time_ms if i == 0 else 0
+                )
+
+                await session_service.create_parsed_row(
+                    session_id=session_id,
+                    row_number=row_num,
+                    transcription=transcription_text if i == 0 else f"(من نفس التسجيل - صف {i + 1})",
+                    llm_response=llm_response_info,
+                    final_data=row_data
+                )
+
+                results.append({
+                    "row_number": row_num,
+                    "extracted_data": row_data
+                })
+
+            return {
+                "success": True,
+                "session_id": session_id,
+                "multi_row": True,
+                "start_row": current_row,
+                "transcription": transcription_text,
+                "rows": results,
+                "total_rows": len(results),
+                "headers": headers,
+                "transcription_confidence": transcription_result.confidence,
+                "processing_time_ms": {
+                    "whisper": transcription_result.processing_time_ms,
+                    "llm": extraction_result.processing_time_ms
+                }
+            }
+
+        else:
+            # Single row - use original extraction
+            try:
+                extraction_result = await llm_service.extract_data(
+                    transcription=transcription_text,
+                    headers=headers
+                )
+
+                if not extraction_result.success:
+                    await session_service.log_error(
+                        session_id=session_id,
+                        error_type=ErrorType.LLM,
+                        error_message=extraction_result.error_message or "Unknown LLM error",
+                        context=ErrorContext(
+                            row_number=current_row,
+                            transcription=transcription_text
+                        )
+                    )
+
+                extracted_data = extraction_result.parsed_data
+
+            except LLMError as e:
+                await session_service.log_error(
+                    session_id=session_id,
+                    error_type=ErrorType.LLM,
+                    error_message=str(e),
+                    stack_trace=traceback.format_exc(),
+                    context=ErrorContext(
+                        row_number=current_row,
+                        transcription=transcription_text
+                    )
+                )
+                extracted_data = {header: None for header in headers}
+                extraction_result = type('obj', (object,), {
+                    'raw_json': '',
+                    'processing_time_ms': 0
+                })()
+
+            # Create parsed row
+            llm_response_info = LLMResponseInfo(
+                raw_json=extraction_result.raw_json if hasattr(extraction_result, 'raw_json') else '',
+                parsed_data=extracted_data,
+                processing_time_ms=extraction_result.processing_time_ms if hasattr(extraction_result, 'processing_time_ms') else 0
+            )
+
+            await session_service.create_parsed_row(
+                session_id=session_id,
+                row_number=current_row,
+                transcription=transcription_text,
+                llm_response=llm_response_info,
+                final_data=extracted_data
+            )
+
+            return {
+                "success": True,
+                "session_id": session_id,
+                "multi_row": False,
+                "start_row": current_row,
+                "transcription": transcription_text,
+                "rows": [{
+                    "row_number": current_row,
+                    "extracted_data": extracted_data
+                }],
+                "total_rows": 1,
+                "headers": headers,
+                "transcription_confidence": transcription_result.confidence,
+                "processing_time_ms": {
+                    "whisper": transcription_result.processing_time_ms,
+                    "llm": extraction_result.processing_time_ms if hasattr(extraction_result, 'processing_time_ms') else 0
+                }
+            }
 
     except HTTPException:
         raise

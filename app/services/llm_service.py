@@ -12,7 +12,14 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 
 from app.config import settings
-from app.prompts.extraction_prompt import SYSTEM_PROMPT, get_extraction_prompt, get_correction_prompt
+from app.prompts.extraction_prompt import (
+    SYSTEM_PROMPT,
+    SYSTEM_PROMPT_MULTI_ROW,
+    ROW_SEPARATOR_KEYWORDS,
+    get_extraction_prompt,
+    get_correction_prompt,
+    get_multi_row_extraction_prompt
+)
 from app.services.arabic_numbers import process_extracted_data
 
 logger = logging.getLogger(__name__)
@@ -23,6 +30,16 @@ class ExtractionResult:
     """Result of data extraction from text."""
     raw_json: str
     parsed_data: Dict[str, Any]
+    processing_time_ms: int
+    success: bool
+    error_message: Optional[str] = None
+
+
+@dataclass
+class MultiRowExtractionResult:
+    """Result of multi-row data extraction from text."""
+    raw_json: str
+    rows: List[Dict[str, Any]]
     processing_time_ms: int
     success: bool
     error_message: Optional[str] = None
@@ -124,6 +141,153 @@ class LLMService:
                 success=False,
                 error_message=str(e)
             )
+
+    def _has_row_separators(self, transcription: str) -> bool:
+        """
+        Check if transcription contains row separator keywords.
+
+        Args:
+            transcription: The transcribed text
+
+        Returns:
+            True if separator keywords are found
+        """
+        transcription_lower = transcription.lower()
+        for keyword in ROW_SEPARATOR_KEYWORDS:
+            if keyword in transcription_lower:
+                return True
+        return False
+
+    async def extract_multi_row_data(
+        self,
+        transcription: str,
+        headers: List[str]
+    ) -> MultiRowExtractionResult:
+        """
+        Extract structured data for multiple rows from transcribed Arabic text.
+
+        Args:
+            transcription: The transcribed text from speech (may contain multiple rows)
+            headers: List of column headers from Excel
+
+        Returns:
+            MultiRowExtractionResult with parsed data for each row
+
+        Raises:
+            LLMError: If extraction fails
+        """
+        start_time = time.time()
+
+        try:
+            # Generate the multi-row prompt
+            user_prompt = get_multi_row_extraction_prompt(headers, transcription)
+
+            # Call Ollama API with multi-row system prompt
+            response_text = await self._call_ollama(
+                system_prompt=SYSTEM_PROMPT_MULTI_ROW,
+                user_prompt=user_prompt
+            )
+
+            # Parse the JSON array response
+            rows = self._parse_multi_row_response(response_text, headers)
+
+            # Process Arabic numbers in each row
+            processed_rows = [
+                process_extracted_data(row, headers)
+                for row in rows
+            ]
+
+            processing_time_ms = int((time.time() - start_time) * 1000)
+
+            logger.info(f"Multi-row extraction complete: {len(processed_rows)} rows in {processing_time_ms}ms")
+
+            return MultiRowExtractionResult(
+                raw_json=response_text,
+                rows=processed_rows,
+                processing_time_ms=processing_time_ms,
+                success=True
+            )
+
+        except Exception as e:
+            processing_time_ms = int((time.time() - start_time) * 1000)
+            logger.error(f"Multi-row data extraction failed: {e}")
+
+            return MultiRowExtractionResult(
+                raw_json="",
+                rows=[],
+                processing_time_ms=processing_time_ms,
+                success=False,
+                error_message=str(e)
+            )
+
+    def _parse_multi_row_response(
+        self,
+        response: str,
+        headers: List[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse JSON array from LLM response for multi-row extraction.
+
+        Args:
+            response: Raw LLM response text
+            headers: Expected column headers
+
+        Returns:
+            List of parsed and validated dictionaries
+
+        Raises:
+            LLMError: If JSON parsing fails
+        """
+        # Clean the response
+        cleaned = response.strip()
+
+        # Remove markdown code blocks if present
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            json_lines = []
+            in_block = False
+            for line in lines:
+                if line.startswith("```") and not in_block:
+                    in_block = True
+                    continue
+                elif line.startswith("```") and in_block:
+                    break
+                elif in_block:
+                    json_lines.append(line)
+            cleaned = "\n".join(json_lines)
+
+        # Try to find JSON array in response
+        json_match = re.search(r'\[[\s\S]*\]', cleaned)
+        if json_match:
+            cleaned = json_match.group()
+
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error: {e}\nResponse: {cleaned}")
+            raise LLMError(f"Invalid JSON response from LLM: {e}")
+
+        if not isinstance(data, list):
+            # If single object returned, wrap in list
+            if isinstance(data, dict):
+                data = [data]
+            else:
+                raise LLMError("LLM response is not a JSON array or object")
+
+        # Validate each row
+        validated_rows = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            validated = {}
+            for header in headers:
+                if header in row:
+                    validated[header] = row[header]
+                else:
+                    validated[header] = None
+            validated_rows.append(validated)
+
+        return validated_rows
 
     async def correct_data(
         self,
