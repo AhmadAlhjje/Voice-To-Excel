@@ -83,12 +83,15 @@ async def add_process_time_header(request: Request, call_next):
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Handle uncaught exceptions."""
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    import traceback
+    error_detail = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logger.error(f"Unhandled exception: {exc}\n{error_detail}", exc_info=True)
     return JSONResponse(
         status_code=500,
         content={
             "error": "Internal server error",
-            "message": str(exc) if settings.debug else "An unexpected error occurred"
+            "message": str(exc),
+            "detail": error_detail if settings.debug else None
         }
     )
 
