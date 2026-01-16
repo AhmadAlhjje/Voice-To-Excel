@@ -32,6 +32,45 @@ class CorrectionRequest(BaseModel):
     correction_text: str
 
 
+@router.get("/{session_id}")
+async def get_all_rows(session_id: str):
+    """
+    Get all parsed rows for a session.
+
+    Args:
+        session_id: Session ID
+
+    Returns:
+        List of all rows with their data
+    """
+    session_service = get_session_service()
+
+    session = await session_service.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+
+    rows = await session_service.get_all_parsed_rows(session_id)
+
+    return {
+        "session_id": session_id,
+        "headers": session.excel_file.headers if session.excel_file else [],
+        "current_row": session.excel_file.current_row if session.excel_file else 1,
+        "total_rows": len(rows),
+        "rows": [
+            {
+                "row_number": row.row_number,
+                "data": row.final_data,
+                "status": row.status,
+                "written_to_excel": row.written_to_excel
+            }
+            for row in rows
+        ]
+    }
+
+
 @router.get("/{session_id}/{row_number}")
 async def get_row(session_id: str, row_number: int):
     """
@@ -83,7 +122,7 @@ async def update_row(
     request: RowUpdateRequest
 ):
     """
-    Update row data manually.
+    Update row data manually and write to Excel file.
 
     Args:
         session_id: Session ID
@@ -94,7 +133,17 @@ async def update_row(
         Updated row data
     """
     session_service = get_session_service()
+    excel_service = get_excel_service()
 
+    # Get session to access Excel file info
+    session = await session_service.get_session(session_id)
+    if not session or not session.excel_file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session or Excel file not found"
+        )
+
+    # Update in database
     row = await session_service.update_parsed_row(
         session_id,
         row_number,
@@ -107,13 +156,37 @@ async def update_row(
             detail="Row not found"
         )
 
-    return {
-        "success": True,
-        "session_id": session_id,
-        "row_number": row_number,
-        "final_data": row.final_data,
-        "status": row.status
-    }
+    try:
+        # Write changes to Excel file immediately
+        excel_service.write_row(
+            file_path=session.excel_file.stored_path,
+            row_number=row_number,
+            data=request.data,
+            headers=session.excel_file.headers
+        )
+
+        # Mark as written
+        await session_service.mark_row_written(session_id, row_number)
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "row_number": row_number,
+            "final_data": row.final_data,
+            "status": "written",
+            "written_to_excel": True
+        }
+    except ExcelError as e:
+        await session_service.log_error(
+            session_id=session_id,
+            error_type=ErrorType.EXCEL,
+            error_message=str(e),
+            context=ErrorContext(row_number=row_number)
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to write to Excel: {e}"
+        )
 
 
 @router.post("/{session_id}/{row_number}/confirm")

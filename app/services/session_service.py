@@ -217,6 +217,16 @@ class SessionService:
             return ParsedRow(**doc)
         return None
 
+    async def get_all_parsed_rows(self, session_id: str) -> List[ParsedRow]:
+        """Get all parsed rows for a session, sorted by row number."""
+        collection = get_parsed_rows_collection()
+        cursor = collection.find({"session_id": session_id}).sort("row_number", 1)
+        rows = []
+        async for doc in cursor:
+            doc["_id"] = str(doc["_id"])
+            rows.append(ParsedRow(**doc))
+        return rows
+
     async def update_parsed_row(
         self,
         session_id: str,
