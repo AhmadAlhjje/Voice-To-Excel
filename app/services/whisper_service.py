@@ -8,6 +8,9 @@ import torch
 import numpy as np
 import time
 import logging
+import subprocess
+import tempfile
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 from dataclasses import dataclass
@@ -143,6 +146,56 @@ class WhisperService:
             logger.error(f"Transcription failed: {e}")
             raise WhisperError(f"Transcription failed: {e}")
 
+    def _convert_to_wav(self, audio_path: str) -> str:
+        """
+        Convert audio file to WAV format using ffmpeg.
+
+        Args:
+            audio_path: Path to the input audio file
+
+        Returns:
+            Path to the converted WAV file
+        """
+        # Create a temporary WAV file
+        temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        temp_wav.close()
+
+        try:
+            # Use ffmpeg to convert to WAV (16kHz mono)
+            cmd = [
+                'ffmpeg',
+                '-i', audio_path,
+                '-ar', '16000',  # 16kHz sample rate
+                '-ac', '1',      # Mono
+                '-y',            # Overwrite output
+                temp_wav.name
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode != 0:
+                logger.error(f"ffmpeg error: {result.stderr}")
+                raise WhisperError(f"Failed to convert audio: {result.stderr}")
+
+            logger.info(f"Converted {audio_path} to WAV format")
+            return temp_wav.name
+
+        except subprocess.TimeoutExpired:
+            os.unlink(temp_wav.name)
+            raise WhisperError("Audio conversion timed out")
+        except FileNotFoundError:
+            os.unlink(temp_wav.name)
+            raise WhisperError("ffmpeg not found. Please install ffmpeg.")
+        except Exception as e:
+            if os.path.exists(temp_wav.name):
+                os.unlink(temp_wav.name)
+            raise
+
     def _load_audio(self, audio_path: str) -> np.ndarray:
         """
         Load and preprocess audio file for Whisper.
@@ -153,7 +206,15 @@ class WhisperService:
         Returns:
             Audio as numpy array
         """
+        temp_wav_path = None
         try:
+            # Check if file needs conversion (webm, ogg, etc.)
+            file_ext = Path(audio_path).suffix.lower()
+            if file_ext in ['.webm', '.ogg', '.mp4', '.m4a', '.mp3', '.aac']:
+                logger.info(f"Converting {file_ext} file to WAV format")
+                temp_wav_path = self._convert_to_wav(audio_path)
+                audio_path = temp_wav_path
+
             # Read audio file
             audio, sample_rate = sf.read(audio_path)
 
@@ -178,9 +239,15 @@ class WhisperService:
 
             return audio
 
+        except WhisperError:
+            raise
         except Exception as e:
             logger.error(f"Failed to load audio: {e}")
             raise WhisperError(f"Failed to load audio file: {e}")
+        finally:
+            # Clean up temporary file
+            if temp_wav_path and os.path.exists(temp_wav_path):
+                os.unlink(temp_wav_path)
 
     def _calculate_confidence(self, result: dict) -> float:
         """
